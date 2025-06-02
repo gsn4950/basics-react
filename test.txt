@@ -1,1 +1,219 @@
-Test commit
+const fs = require('fs');
+const path = require('path');
+const { MongoClient } = require('mongodb');
+const JSONStream = require('JSONStream');
+const { promisify } = require('util');
+const readdir = promisify(fs.readdir);
+const stat = promisify(fs.stat);
+
+// Configuration
+const CONFIG = {
+    JSON_DIR: path.join(__dirname, 'members'),      // Folder with JSON files
+    DB_URI: 'mongodb://localhost:27017',           // MongoDB connection string
+    DB_NAME: 'Local_test',                         // Database name
+    COLLECTION_NAME: 'membersData',                // Collection name
+    ID_FIELD: 'memberPersonID',                    // Unique identifier field
+    OVERRIDE_EXISTING: false,                      // Set to true to overwrite existing docs
+    BATCH_SIZE: 1000,                              // Documents per bulk operation
+    FILE_CONCURRENCY: 8,                           // Files processed concurrently
+    FILE_CHUNK_SIZE: 500                           // Files processed per memory cycle
+};
+
+async function importMembers() {
+    const client = new MongoClient(CONFIG.DB_URI, {
+        useNewUrlParser: true,
+        useUnifiedTopology: true,
+        poolSize: 20,                             // Increase connection pool
+        useUnifiedTopology: true
+    });
+
+    try {
+        await client.connect();
+        console.log('Connected to MongoDB');
+        const db = client.db(CONFIG.DB_NAME);
+        const collection = db.collection(CONFIG.COLLECTION_NAME);
+
+        // Create index for performance
+        console.log('Ensuring index exists...');
+        await collection.createIndex({ [CONFIG.ID_FIELD]: 1 }, { unique: true });
+        
+        // Get file list in chunks
+        const allFiles = await getJsonFiles();
+        console.log(`Found ${allFiles.length} JSON files to process`);
+
+        // Process files in memory-friendly chunks
+        for (let i = 0; i < allFiles.length; i += CONFIG.FILE_CHUNK_SIZE) {
+            const chunk = allFiles.slice(i, i + CONFIG.FILE_CHUNK_SIZE);
+            await processFileChunk(chunk, collection);
+            console.log(`Processed ${Math.min(i + CONFIG.FILE_CHUNK_SIZE, allFiles.length)}/${allFiles.length} files`);
+            
+            // Manual garbage collection hint
+            if (global.gc && i % (CONFIG.FILE_CHUNK_SIZE * 5) === 0) {
+                global.gc();
+                console.log('Performed garbage collection');
+            }
+        }
+
+        console.log('🎉 All files imported successfully!');
+    } catch (err) {
+        console.error('❌ Import failed:', err);
+        process.exit(1);
+    } finally {
+        await client.close();
+        console.log('MongoDB connection closed');
+    }
+}
+
+async function getJsonFiles() {
+    const files = await readdir(CONFIG.JSON_DIR);
+    const jsonFiles = files.filter(f => f.toLowerCase().endsWith('.json'));
+    
+    // Get file paths with size info
+    const filesWithSize = await Promise.all(jsonFiles.map(async file => {
+        const filePath = path.join(CONFIG.JSON_DIR, file);
+        const stats = await stat(filePath);
+        return {
+            name: file,
+            path: filePath,
+            size: stats.size
+        };
+    }));
+    
+    // Sort by size (smallest first) for better memory progression
+    return filesWithSize.sort((a, b) => a.size - b.size);
+}
+
+async function processFileChunk(files, collection) {
+    // Process files concurrently with limited parallelism
+    const workers = [];
+    for (let i = 0; i < files.length; i += CONFIG.FILE_CONCURRENCY) {
+        const batch = files.slice(i, i + CONFIG.FILE_CONCURRENCY);
+        workers.push(Promise.all(batch.map(file => processFile(file, collection)));
+        await new Promise(resolve => setTimeout(resolve, 100)); // Brief pause
+    }
+    await Promise.all(workers);
+}
+
+async function processFile(fileInfo, collection) {
+    const { name, path: filePath, size } = fileInfo;
+    console.log(`Processing ${name} (${formatFileSize(size)})`);
+    
+    let batchBuffer = [];
+    let processedCount = 0;
+    let skippedCount = 0;
+    let updatedCount = 0;
+    let errorCount = 0;
+
+    return new Promise((resolve, reject) => {
+        const stream = fs.createReadStream(filePath, { encoding: 'utf8' })
+            .pipe(JSONStream.parse('*'))
+            .on('data', async (doc) => {
+                stream.pause();
+                
+                try {
+                    // Validate document
+                    if (!doc || typeof doc !== 'object') {
+                        throw new Error('Invalid document format');
+                    }
+                    
+                    if (!doc[CONFIG.ID_FIELD]) {
+                        throw new Error(`Missing ${CONFIG.ID_FIELD} field`);
+                    }
+                    
+                    // Add to batch
+                    batchBuffer.push(prepareOperation(doc));
+                    
+                    // Process batch when full
+                    if (batchBuffer.length >= CONFIG.BATCH_SIZE) {
+                        await safeBatchProcess(collection, batchBuffer);
+                        batchBuffer = [];
+                    }
+                } catch (err) {
+                    errorCount++;
+                    console.error(`⚠️ [${name}] Error: ${err.message}`);
+                } finally {
+                    stream.resume();
+                }
+            })
+            .on('end', async () => {
+                try {
+                    // Process final batch
+                    if (batchBuffer.length > 0) {
+                        await safeBatchProcess(collection, batchBuffer);
+                    }
+                    
+                    console.log(`✔️ Completed ${name}: ` +
+                                `${processedCount} processed, ` +
+                                `${updatedCount} updated, ` +
+                                `${skippedCount} skipped, ` +
+                                `${errorCount} errors`);
+                    resolve();
+                } catch (err) {
+                    reject(err);
+                }
+            })
+            .on('error', reject);
+        
+        async function safeBatchProcess(coll, batch) {
+            try {
+                const bulkOps = batch.map(op => ({
+                    updateOne: {
+                        filter: { [CONFIG.ID_FIELD]: op.idValue },
+                        update: op.update,
+                        upsert: true
+                    }
+                }));
+                
+                const result = await coll.bulkWrite(bulkOps, {
+                    ordered: false,
+                    writeConcern: { w: 1 }
+                });
+                
+                processedCount += batch.length;
+                updatedCount += result.modifiedCount;
+                skippedCount += batch.length - result.upsertedCount - result.modifiedCount;
+            } catch (bulkErr) {
+                errorCount += batch.length;
+                if (bulkErr.name === 'BulkWriteError') {
+                    console.error(`⚠️ [${name}] Bulk error: ${bulkErr.message}`);
+                } else {
+                    console.error(`⚠️ [${name}] Critical batch error:`, bulkErr);
+                }
+            }
+        }
+        
+        function prepareOperation(doc) {
+            const idValue = doc[CONFIG.ID_FIELD];
+            
+            if (CONFIG.OVERRIDE_EXISTING) {
+                return {
+                    idValue,
+                    update: { $set: doc }  // Full document replacement
+                };
+            }
+            
+            return {
+                idValue,
+                update: {
+                    $setOnInsert: doc     // Only insert new docs
+                }
+            };
+        }
+    });
+}
+
+function formatFileSize(bytes) {
+    if (bytes < 1024) return bytes + ' B';
+    if (bytes < 1048576) return (bytes / 1024).toFixed(1) + ' KB';
+    return (bytes / 1048576).toFixed(1) + ' MB';
+}
+
+// Start the import process with memory protection
+(async () => {
+    try {
+        await importMembers();
+    } catch (err) {
+        console.error('Unhandled top-level error:', err);
+        process.exit(1);
+    }
+})();
