@@ -1,0 +1,240 @@
+const fs = require('fs');
+const path = require('path');
+const { MongoClient } = require('mongodb');
+const { promisify } = require('util');
+const readdir = promisify(fs.readdir);
+const stat = promisify(fs.stat);
+
+// Load configuration from external file
+const config = require('./config');
+
+// Import configuration
+const CONFIG = {
+    JSON_DIR: path.join(__dirname, 'members'),
+    DB_URI: config.DB_URI,
+    DB_NAME: 'Local_test',
+    COLLECTION_NAME: 'membersData',
+    ID_FIELD: 'memberPersonID',
+    OVERRIDE_EXISTING: false,
+    FILE_CONCURRENCY: 4,
+    FILE_CHUNK_SIZE: 100,
+    SKIPPED_LOG: path.join(__dirname, 'skipped_files.log') // Log file path
+};
+
+// Validate configuration
+if (!CONFIG.DB_URI || !CONFIG.DB_URI.startsWith('mongodb://')) {
+    throw new Error('Invalid DB_URI in configuration');
+}
+
+// Initialize skipped files log (overwrite existing)
+fs.writeFileSync(CONFIG.SKIPPED_LOG, 'Skipped Files Log\n=================\n\n');
+
+async function importMembers() {
+    const client = new MongoClient(CONFIG.DB_URI, {
+        maxPoolSize: 20,
+        minPoolSize: 5,
+        serverSelectionTimeoutMS: 30000
+    });
+
+    try {
+        await client.connect();
+        console.log('Connected to MongoDB');
+        const db = client.db(CONFIG.DB_NAME);
+        const collection = db.collection(CONFIG.COLLECTION_NAME);
+
+        console.log('Ensuring index exists...');
+        await collection.createIndex({ [CONFIG.ID_FIELD]: 1 }, { unique: true });
+        
+        const allFiles = await getJsonFiles();
+        console.log(`Found ${allFiles.length} JSON files to process`);
+        
+        let totalProcessed = 0;
+        let totalSkipped = 0;
+        let totalFilesProcessed = 0;
+        let totalFilesSkipped = 0;
+
+        for (let i = 0; i < allFiles.length; i += CONFIG.FILE_CHUNK_SIZE) {
+            const chunk = allFiles.slice(i, i + CONFIG.FILE_CHUNK_SIZE);
+            const chunkResults = await processFileChunk(chunk, collection);
+            
+            // Accumulate results
+            totalProcessed += chunkResults.processed;
+            totalSkipped += chunkResults.skipped;
+            totalFilesProcessed += chunkResults.filesProcessed;
+            totalFilesSkipped += chunkResults.filesSkipped;
+            
+            console.log(`Processed ${i + chunk.length}/${allFiles.length} files | ` +
+                        `Files: +${chunkResults.filesProcessed} ✔️ -${chunkResults.filesSkipped} ⏭️ | ` +
+                        `Docs: +${chunkResults.processed} -${chunkResults.skipped}`);
+        }
+
+        console.log('\n🎉 Import Summary:');
+        console.log(`- Total files: ${allFiles.length}`);
+        console.log(`- Successfully processed: ${totalFilesProcessed} files`);
+        console.log(`- Skipped: ${totalFilesSkipped} files`);
+        console.log(`- Documents imported: ${totalProcessed}`);
+        console.log(`- Documents skipped: ${totalSkipped}`);
+        console.log(`\nSkipped files logged to: ${CONFIG.SKIPPED_LOG}`);
+        
+        return {
+            totalFiles: allFiles.length,
+            filesProcessed: totalFilesProcessed,
+            filesSkipped: totalFilesSkipped,
+            docsProcessed: totalProcessed,
+            docsSkipped: totalSkipped
+        };
+    } catch (err) {
+        console.error('❌ Import failed:', err);
+        throw err;
+    } finally {
+        await client.close();
+        console.log('MongoDB connection closed');
+    }
+}
+
+async function getJsonFiles() {
+    const files = await readdir(CONFIG.JSON_DIR);
+    const jsonFiles = files.filter(f => f.toLowerCase().endsWith('.json'));
+    
+    const filesWithSize = await Promise.all(jsonFiles.map(async file => {
+        const filePath = path.join(CONFIG.JSON_DIR, file);
+        const stats = await stat(filePath);
+        return {
+            name: file,
+            path: filePath,
+            size: stats.size
+        };
+    }));
+    
+    return filesWithSize.sort((a, b) => a.size - b.size);
+}
+
+async function processFileChunk(files, collection) {
+    const workers = [];
+    const results = {
+        processed: 0,
+        skipped: 0,
+        filesProcessed: 0,
+        filesSkipped: 0
+    };
+    
+    for (let i = 0; i < files.length; i += CONFIG.FILE_CONCURRENCY) {
+        const batch = files.slice(i, i + CONFIG.FILE_CONCURRENCY);
+        const batchResults = await Promise.all(batch.map(file => processFile(file, collection)));
+        
+        // Aggregate batch results
+        batchResults.forEach(res => {
+            results.processed += res.processed;
+            results.skipped += res.skipped;
+            results.filesProcessed += res.fileProcessed ? 1 : 0;
+            results.filesSkipped += res.fileSkipped ? 1 : 0;
+        });
+    }
+    
+    return results;
+}
+
+async function processFile(fileInfo, collection) {
+    const { name, path: filePath } = fileInfo;
+    const result = {
+        processed: 0,
+        skipped: 0,
+        fileProcessed: false,
+        fileSkipped: false
+    };
+    
+    try {
+        // Read and parse the entire file
+        const content = await fs.promises.readFile(filePath, 'utf8');
+        const data = JSON.parse(content);
+        
+        // Handle both single documents and arrays
+        const documents = Array.isArray(data) ? data : [data];
+        
+        // Track if any document was processed
+        let fileHadValidDocs = false;
+        
+        for (const doc of documents) {
+            // Validate document
+            if (!doc || typeof doc !== 'object' || Array.isArray(doc)) {
+                logSkippedFile(name, 'Invalid document format - must be a JSON object');
+                continue;
+            }
+            
+            if (!doc[CONFIG.ID_FIELD]) {
+                logSkippedFile(name, `Missing ${CONFIG.ID_FIELD} field`);
+                result.skipped++;
+                continue;
+            }
+            
+            // Prepare update operation
+            const idValue = doc[CONFIG.ID_FIELD];
+            const updateOp = CONFIG.OVERRIDE_EXISTING
+                ? { $set: doc }  // Full document replacement
+                : { $setOnInsert: doc };  // Only set on insert
+            
+            // Execute update operation
+            try {
+                const updateResult = await collection.updateOne(
+                    { [CONFIG.ID_FIELD]: idValue },
+                    updateOp,
+                    { upsert: true }
+                );
+                
+                if (updateResult.upsertedCount > 0 || updateResult.modifiedCount > 0) {
+                    result.processed++;
+                    fileHadValidDocs = true;
+                } else {
+                    result.skipped++;
+                }
+            } catch (dbError) {
+                logSkippedFile(name, `Database error: ${dbError.message}`);
+                result.skipped++;
+            }
+        }
+        
+        if (fileHadValidDocs) {
+            result.fileProcessed = true;
+            console.log(`✔️ ${name}: ${result.processed} docs processed, ${result.skipped} skipped`);
+        } else {
+            result.fileSkipped = true;
+            console.log(`⏭️ ${name}: All documents skipped`);
+        }
+        
+        return result;
+    } catch (parseError) {
+        logSkippedFile(name, `Parse error: ${parseError.message}`);
+        result.fileSkipped = true;
+        result.skipped = documents?.length || 1; // Estimate document count
+        console.error(`⚠️ ${name}: File skipped - ${parseError.message}`);
+        return result;
+    }
+}
+
+function logSkippedFile(filename, reason) {
+    const logEntry = `[${new Date().toISOString()}] ${filename}: ${reason}\n`;
+    fs.appendFileSync(CONFIG.SKIPPED_LOG, logEntry);
+}
+
+function formatFileSize(bytes) {
+    if (bytes < 1024) return bytes + ' B';
+    if (bytes < 1048576) return (bytes / 1024).toFixed(1) + ' KB';
+    return (bytes / 1048576).toFixed(1) + ' MB';
+}
+
+// Start the import process
+(async () => {
+    try {
+        const results = await importMembers();
+        console.log('\n✅ Final Results:');
+        console.log(`- Files: ${results.totalFiles} total, ` +
+                   `${results.filesProcessed} processed, ` +
+                   `${results.filesSkipped} skipped`);
+        console.log(`- Documents: ${results.docsProcessed + results.docsSkipped} total, ` +
+                   `${results.docsProcessed} imported, ` +
+                   `${results.docsSkipped} skipped`);
+    } catch (err) {
+        console.error('Fatal import error:', err);
+        process.exit(1);
+    }
+})();
