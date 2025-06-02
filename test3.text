@@ -1,0 +1,164 @@
+const fs = require('fs');
+const path = require('path');
+const { MongoClient } = require('mongodb');
+const { promisify } = require('util');
+const readdir = promisify(fs.readdir);
+const stat = promisify(fs.stat);
+
+// Load configuration from external file
+const config = require('./config');
+
+// Import configuration
+const CONFIG = {
+    JSON_DIR: path.join(__dirname, 'members'),
+    DB_URI: config.DB_URI,
+    DB_NAME: 'Local_test',
+    COLLECTION_NAME: 'membersData',
+    ID_FIELD: 'memberPersonID',
+    OVERRIDE_EXISTING: false,
+    FILE_CONCURRENCY: 4,
+    FILE_CHUNK_SIZE: 100
+};
+
+// Validate configuration
+if (!CONFIG.DB_URI || !CONFIG.DB_URI.startsWith('mongodb://')) {
+    throw new Error('Invalid DB_URI in configuration');
+}
+
+async function importMembers() {
+    const client = new MongoClient(CONFIG.DB_URI, {
+        maxPoolSize: 20,
+        minPoolSize: 5,
+        serverSelectionTimeoutMS: 30000
+    });
+
+    try {
+        await client.connect();
+        console.log('Connected to MongoDB');
+        const db = client.db(CONFIG.DB_NAME);
+        const collection = db.collection(CONFIG.COLLECTION_NAME);
+
+        console.log('Ensuring index exists...');
+        await collection.createIndex({ [CONFIG.ID_FIELD]: 1 }, { unique: true });
+        
+        const allFiles = await getJsonFiles();
+        console.log(`Found ${allFiles.length} JSON files to process`);
+
+        for (let i = 0; i < allFiles.length; i += CONFIG.FILE_CHUNK_SIZE) {
+            const chunk = allFiles.slice(i, i + CONFIG.FILE_CHUNK_SIZE);
+            await processFileChunk(chunk, collection);
+            console.log(`Processed ${Math.min(i + CONFIG.FILE_CHUNK_SIZE, allFiles.length)}/${allFiles.length} files`);
+        }
+
+        console.log('🎉 All files imported successfully!');
+        return allFiles.length;
+    } catch (err) {
+        console.error('❌ Import failed:', err);
+        throw err;
+    } finally {
+        await client.close();
+        console.log('MongoDB connection closed');
+    }
+}
+
+async function getJsonFiles() {
+    const files = await readdir(CONFIG.JSON_DIR);
+    const jsonFiles = files.filter(f => f.toLowerCase().endsWith('.json'));
+    
+    const filesWithSize = await Promise.all(jsonFiles.map(async file => {
+        const filePath = path.join(CONFIG.JSON_DIR, file);
+        const stats = await stat(filePath);
+        return {
+            name: file,
+            path: filePath,
+            size: stats.size
+        };
+    }));
+    
+    return filesWithSize.sort((a, b) => a.size - b.size);
+}
+
+async function processFileChunk(files, collection) {
+    const workers = [];
+    for (let i = 0; i < files.length; i += CONFIG.FILE_CONCURRENCY) {
+        const batch = files.slice(i, i + CONFIG.FILE_CONCURRENCY);
+        workers.push(Promise.all(batch.map(file => processFile(file, collection))));
+        await new Promise(resolve => setTimeout(resolve, 50));
+    }
+    await Promise.all(workers);
+}
+
+async function processFile(fileInfo, collection) {
+    const { name, path: filePath, size } = fileInfo;
+    console.log(`Processing ${name} (${formatFileSize(size)})`);
+    
+    try {
+        // Read and parse the entire file
+        const content = await fs.promises.readFile(filePath, 'utf8');
+        const data = JSON.parse(content);
+        
+        // Handle both single documents and arrays
+        const documents = Array.isArray(data) ? data : [data];
+        
+        // Process documents
+        let processedCount = 0;
+        let skippedCount = 0;
+        let updatedCount = 0;
+        
+        for (const doc of documents) {
+            // Validate document
+            if (!doc || typeof doc !== 'object' || Array.isArray(doc)) {
+                throw new Error('Invalid document format - must be an object');
+            }
+            
+            if (!doc[CONFIG.ID_FIELD]) {
+                throw new Error(`Missing ${CONFIG.ID_FIELD} field`);
+            }
+            
+            // Prepare update operation
+            const idValue = doc[CONFIG.ID_FIELD];
+            const updateOp = CONFIG.OVERRIDE_EXISTING
+                ? { $set: doc }  // Full document replacement
+                : { $setOnInsert: doc };  // Only set on insert
+            
+            // Execute update operation
+            const result = await collection.updateOne(
+                { [CONFIG.ID_FIELD]: idValue },
+                updateOp,
+                { upsert: true }
+            );
+            
+            // Update counters
+            processedCount++;
+            if (result.upsertedCount > 0) {
+                // New document inserted
+            } else if (result.modifiedCount > 0) {
+                updatedCount++;
+            } else {
+                skippedCount++;
+            }
+        }
+        
+        console.log(`✔️ Completed ${name}: ${processedCount} processed, ` +
+                    `${updatedCount} updated, ${skippedCount} skipped`);
+    } catch (err) {
+        console.error(`⚠️ Error processing ${name}: ${err.message}`);
+    }
+}
+
+function formatFileSize(bytes) {
+    if (bytes < 1024) return bytes + ' B';
+    if (bytes < 1048576) return (bytes / 1024).toFixed(1) + ' KB';
+    return (bytes / 1048576).toFixed(1) + ' MB';
+}
+
+// Start the import process
+(async () => {
+    try {
+        const fileCount = await importMembers();
+        console.log(`Successfully processed ${fileCount} files`);
+    } catch (err) {
+        console.error('Fatal import error:', err);
+        process.exit(1);
+    }
+})();
