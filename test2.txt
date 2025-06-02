@@ -1,0 +1,15 @@
+// Test script test-connection.js
+const { MongoClient } = require('mongodb');
+const config = require('./config');
+
+(async () => {
+  const client = new MongoClient(config.DB_URI);
+  try {
+    await client.connect();
+    console.log('Connection successful!');
+  } catch (err) {
+    console.error('Connection failed:', err);
+  } finally {
+    await client.close();
+  }
+})();
