@@ -1,0 +1,41 @@
+describe('Multi-tab Workaround', () => {
+  it('handles the new tab flow', () => {
+    // Step 1: Visit original domain while overriding window.open
+    cy.visit('https://original-domain.com', {
+      onBeforeLoad(win) {
+        // Stub window.open to redirect to new URL in SAME tab
+        cy.stub(win, 'open').callsFake(url => {
+          win.location.href = url;
+          return {
+            close: () => win.dispatchEvent(new Event('popupClosed'))
+          };
+        });
+      }
+    });
+
+    // Step 2: Save original URL before it gets replaced
+    cy.url().then(originalUrl => {
+      localStorage.setItem('originalTabUrl', originalUrl);
+    });
+
+    // Step 3: Trigger URL change (simulates entering new address)
+    cy.window().then(win => {
+      win.location.href = 'https://new-tab-domain.com';
+    });
+
+    // Step 4: Interact with elements in the "new tab" (now in same tab)
+    cy.get('#close-button').click(); // Element that closes new tab
+
+    // Step 5: Restore original context
+    cy.window().should(() => {
+      expect(localStorage.getItem('popupClosed')).to.eq('true');
+    }).then(() => {
+      // Navigate back to original URL
+      cy.visit(localStorage.getItem('originalTabUrl'));
+      localStorage.removeItem('popupClosed');
+    });
+
+    // Step 6: Continue testing original tab
+    cy.get('#original-element').should('be.visible');
+  });
+});
